@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.idea/
+logs/
+uploads/
+uvicorn_*.log
+verify_*.py
+check_ex.py
+debug_issues.py
+list_exercises.py
+*.bat
+.pytest_cache/
