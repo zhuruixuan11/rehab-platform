@@ -1,4 +1,4 @@
-"""康复业务接口：康复档案、康复评估、筛查预警、排班预约、康复报告、中医体质辨识。"""
+﻿"""康复业务接口：康复档案、康复评估、筛查预警、排班预约、康复报告、中医体质辨识。"""
 import json
 from datetime import date, datetime, timedelta
 
@@ -616,15 +616,21 @@ def create_appointment(data: AppointmentIn, user: dict = Depends(get_current_use
             raise HTTPException(404, "排班不存在")
         if schedule["work_date"] < today:
             raise HTTPException(400, "该排班已过期")
-        booked = db.query(
-            "SELECT COUNT(*) AS c FROM appointments WHERE schedule_id=%s "
-            "AND status IN ('booked','completed')", (data.schedule_id,), one=True)["c"]
-        if booked >= (schedule["capacity"] or 1):
-            raise HTTPException(400, "该时段已约满，请选择其他时间")
         coach_id = schedule["coach_id"]
         appt_date = schedule["work_date"]
         start_time = data.start_time or schedule["start_time"]
         end_time = data.end_time or _time_add(start_time, schedule["slot_min"] or 30)
+        if not (schedule["start_time"] <= start_time and end_time <= schedule["end_time"]):
+            raise HTTPException(400, f"预约时间需在排班时段 {schedule['start_time']}–{schedule['end_time']} 内")
+        capacity = schedule["capacity"] or 1
+        # 同一排班内按“时段重叠”占号：容量多少就允许几个重叠预约
+        overlap = db.query(
+            "SELECT COUNT(*) AS c FROM appointments WHERE schedule_id=%s "
+            "AND status IN ('booked','completed') AND start_time < %s "
+            "AND (COALESCE(end_time,'') = '' OR end_time > %s)",
+            (data.schedule_id, end_time, start_time), one=True)["c"]
+        if overlap >= capacity:
+            raise HTTPException(400, f"该时段已约满（容量 {capacity} 人），请选择其他时间")
     else:
         if not data.coach_id or not data.appt_date or not data.start_time:
             raise HTTPException(400, "请选择康复治疗师、日期与时间")
@@ -635,11 +641,28 @@ def create_appointment(data: AppointmentIn, user: dict = Depends(get_current_use
         if not coach:
             raise HTTPException(400, "康复治疗师不存在")
         coach_id, appt_date = data.coach_id, data.appt_date
-        start_time, end_time = data.start_time, data.end_time
+        start_time = data.start_time
+        end_time = data.end_time or _time_add(start_time, 30)
+        # 若该治疗师当天有排班，沿用排班容量与时段约束；没有排班则默认容量 1
+        schedule = db.query(
+            "SELECT * FROM therapist_schedules WHERE coach_id=%s AND work_date=%s "
+            "AND start_time <= %s AND end_time >= %s ORDER BY start_time LIMIT 1",
+            (coach_id, appt_date, start_time, end_time), one=True)
+        capacity = (schedule["capacity"] or 1) if schedule else 1
+        if schedule and not (schedule["start_time"] <= start_time and end_time <= schedule["end_time"]):
+            raise HTTPException(400, f"预约时间需在治疗师排班时段 {schedule['start_time']}–{schedule['end_time']} 内")
+        overlap = db.query(
+            "SELECT COUNT(*) AS c FROM appointments WHERE coach_id=%s AND appt_date=%s "
+            "AND status IN ('booked','completed') AND start_time < %s "
+            "AND (COALESCE(end_time,'') = '' OR end_time > %s)",
+            (coach_id, appt_date, end_time, start_time), one=True)["c"]
+        if overlap >= capacity:
+            raise HTTPException(400, f"该治疗师时段已约满（容量 {capacity} 人），请选择其他时间")
 
     dup = db.query(
-        "SELECT id FROM appointments WHERE patient_id=%s AND appt_date=%s AND start_time=%s "
-        "AND status='booked'", (user["id"], appt_date, start_time), one=True)
+        "SELECT id FROM appointments WHERE patient_id=%s AND appt_date=%s "
+        "AND status='booked' AND start_time < %s AND (COALESCE(end_time,'') = '' OR end_time > %s)",
+        (user["id"], appt_date, end_time, start_time), one=True)
     if dup:
         raise HTTPException(400, "该时段已有预约")
     aid = db.insert(
@@ -1023,3 +1046,4 @@ def tcm_assess(data: TcmIn, user: dict = Depends(get_current_user)):
     db.execute("INSERT INTO tcm_constitutions (patient_id, primary_type, scores_json, advice) VALUES (%s,%s,%s,%s)",
                (user["id"], primary, json.dumps(scores, ensure_ascii=False), full))
     return {"ok": True, "primary_type": primary, "scores": scores, "advice": full}
+

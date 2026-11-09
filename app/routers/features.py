@@ -1,13 +1,19 @@
 """P1/P2 变现功能接口：AI点评 / 邀请裂变 / 优惠券 / 教练收益提现 / 营收看板 / 会员内容墙。"""
+import json
+import uuid
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.deps import get_current_user, require_role
 from app.config import settings
 from app.database import db
 from app.routers.member import user_is_member, get_active_subscription
-from app.utils.email import send_email, is_configured, checkin_reminder_html
+from app.services import payment
+from app.services.pose import PoseError, analyze_image
+from app.utils.email import send_email, is_configured, checkin_reminder_html, retry_outbox
 
 router = APIRouter(prefix="/api/features", tags=["变现功能"])
 
@@ -16,29 +22,39 @@ router = APIRouter(prefix="/api/features", tags=["变现功能"])
 class AIEvaluateIn(BaseModel):
     image_url: str
     checkin_id: int | None = None
+    exercise: str = "auto"  # auto / squat / shoulder_abduction
+
+
+def _resolve_upload(image_url: str) -> Path:
+    """把 /uploads/... 的相对地址安全解析为上传目录内的绝对路径。"""
+    rel = (image_url or "").strip()
+    if rel.startswith("/uploads/"):
+        rel = rel[len("/uploads/"):]
+    rel = rel.lstrip("/\\")
+    base = Path(settings.UPLOAD_DIR).resolve()
+    target = (base / rel).resolve() if rel else base
+    if base not in target.parents:
+        raise HTTPException(400, "图片路径不合法")
+    if not target.is_file():
+        raise HTTPException(404, "图片不存在，请重新上传")
+    return target
 
 
 @router.post("/ai-evaluate")
 def ai_evaluate(data: AIEvaluateIn, user: dict = Depends(get_current_user)):
-    """上传打卡图片，AI姿势点评（会员专属）。Mock返回模拟分析，真实上线接百度AI人体关键点。"""
+    """上传动作照片，BlazePose 关键点 + 几何规则评分（CPU 推理，结果确定）。"""
     if not user_is_member(user["id"]):
         raise HTTPException(403, "AI姿势点评为会员专属功能")
-    # 模拟AI评分（真实接百度AI: https://aip.baidubce.com/rest/2.0/image-classify/v1/body_analysis）
-    import random
-    score = random.randint(65, 95)
-    analysis = {
-        "score": score,
-        "pose": "深蹲" if "squat" in (data.image_url or "") else "综合动作",
-        "issues": [
-            "膝盖略微超过脚尖，建议重心后移",
-            "背部微弓，注意收紧核心保持挺直",
-        ] if score < 85 else ["动作标准，保持！"],
-        "tips": "建议每组间休息60秒，注意呼吸节奏"
-    }
+    target = _resolve_upload(data.image_url)
+    try:
+        analysis = analyze_image(target, data.exercise, data.image_url)
+    except PoseError as exc:
+        raise HTTPException(422, str(exc))
     db.execute("INSERT INTO ai_evaluations (user_id, checkin_id, image_url, score, analysis) VALUES (%s,%s,%s,%s,%s)",
-               (user["id"], data.checkin_id, data.image_url, score, str(analysis)))
+               (user["id"], data.checkin_id, data.image_url, analysis["score"],
+                json.dumps(analysis, ensure_ascii=False)))
     eid = db.query("SELECT LAST_INSERT_ID() id", one=True)["id"]
-    return {"id": eid, "score": score, "analysis": analysis}
+    return {"id": eid, "score": analysis["score"], "analysis": analysis}
 
 
 @router.get("/ai-evaluations")
@@ -47,21 +63,33 @@ def list_evaluations(page: int = 1, page_size: int = 10, user: dict = Depends(ge
     rows = db.query("SELECT * FROM ai_evaluations WHERE user_id=%s ORDER BY id DESC LIMIT %s OFFSET %s",
                     (user["id"], page_size, offset))
     for r in rows:
-        try: r["analysis"] = eval(r["analysis"])
-        except: pass
+        try:
+            r["analysis"] = json.loads(r["analysis"])
+        except (TypeError, ValueError):
+            pass
     return rows
 
 
 # ==================== P1-8 邀请裂变 ====================
 @router.get("/invite/info")
-def invite_info(user: dict = Depends(get_current_user)):
+def invite_info(request: Request, user: dict = Depends(get_current_user)):
     """获取我的邀请码、邀请链接、已邀请人数和获得的奖励。"""
     total = db.query("SELECT COUNT(*) c FROM invitations WHERE inviter_id=%s AND status='claimed'", (user["id"],), one=True)["c"]
     list_inv = db.query("SELECT i.*, u.nickname FROM invitations i JOIN users u ON u.id=i.invitee_id "
                         "WHERE i.inviter_id=%s ORDER BY i.id DESC LIMIT 20", (user["id"],))
+    base = (settings.PUBLIC_BASE_URL or str(request.base_url)).rstrip("/")
+    invite_code = user.get("invite_code")
+    if not invite_code:
+        for _ in range(5):
+            code = f"KH{user['id']:04d}{uuid.uuid4().hex[:4].upper()}"
+            if not db.query("SELECT id FROM users WHERE invite_code=%s", (code,), one=True):
+                db.execute("UPDATE users SET invite_code=%s WHERE id=%s", (code, user["id"]))
+                invite_code = code
+                break
+    invite_code = invite_code or ""
     return {
-        "invite_code": user.get("invite_code") or "",
-        "invite_link": f"http://localhost:8002/register?code={user.get('invite_code','')}",
+        "invite_code": invite_code,
+        "invite_link": f"{base}/register?code={invite_code}",
         "invited_count": total,
         "reward_days_total": total * 7,
         "list": list_inv,
@@ -147,6 +175,14 @@ def revenue_dashboard(user: dict = Depends(require_role("admin"))):
 
 
 # ==================== P2-12 教练收益 + 提现 ====================
+def _mask_card(card: str | None) -> str:
+    """银行卡号脱敏：只保留前 4 位与后 4 位。"""
+    digits = "".join(ch for ch in (card or "") if ch.isdigit())
+    if len(digits) < 8:
+        return "****"
+    return f"{digits[:4]} **** **** {digits[-4:]}"
+
+
 def _coach_balance(coach_id: int) -> dict:
     """教练收益余额：付费定制抽成收入 - 已提现 - 待审核。"""
     rows = db.query("SELECT s.amount, cp.commission_rate FROM subscriptions s "
@@ -161,14 +197,18 @@ def _coach_balance(coach_id: int) -> dict:
     pending = float(db.query("SELECT COALESCE(SUM(amount),0) t FROM withdrawals WHERE coach_id=%s AND status='pending'",
                              (coach_id,), one=True)["t"])
     return {"total_earned": round(total_earned, 2), "withdrawn": round(withdrawn, 2),
-            "pending": round(pending, 2), "available": round(total_earned - withdrawn - pending, 2)}
+            "pending": round(pending, 2), "frozen": round(pending, 2),
+            "available": round(total_earned - withdrawn - pending, 2)}
 
 
 @router.get("/coach/earnings")
 def coach_earnings(user: dict = Depends(require_role("coach"))):
-    """教练收益：付费定制抽成收入、提现记录。"""
+    """教练收益：付费定制抽成收入、提现记录（卡号脱敏）。"""
     bal = _coach_balance(user["id"])
-    bal["withdrawals"] = db.query("SELECT * FROM withdrawals WHERE coach_id=%s ORDER BY id DESC", (user["id"],))
+    rows = db.query("SELECT * FROM withdrawals WHERE coach_id=%s ORDER BY id DESC", (user["id"],))
+    for r in rows:
+        r["bank_account"] = _mask_card(r.get("bank_account"))
+    bal["withdrawals"] = rows
     return bal
 
 
@@ -183,12 +223,20 @@ class WithdrawIn(BaseModel):
 def coach_withdraw(data: WithdrawIn, user: dict = Depends(require_role("coach"))):
     if data.amount <= 0:
         raise HTTPException(400, "金额必须大于0")
+    digits = "".join(ch for ch in (data.bank_account or "") if ch.isdigit())
+    if not 16 <= len(digits) <= 19:
+        raise HTTPException(400, "银行卡号需为 16–19 位数字")
     available = _coach_balance(user["id"])["available"]
     if data.amount > available:
         raise HTTPException(400, f"超出可提现余额 ¥{available:.2f}")
-    db.execute("INSERT INTO withdrawals (coach_id, amount, bank_name, bank_account, remark) VALUES (%s,%s,%s,%s,%s)",
-               (user["id"], data.amount, data.bank_name, data.bank_account, data.remark))
-    return {"ok": True, "msg": "提现申请已提交，等待管理员审核"}
+    amount = round(float(data.amount), 2)
+    flow_no = payment.new_flow_no("WD")
+    # 待审核金额即冻结额度：申请时立即占用 available，审核拒绝后释放
+    db.execute("INSERT INTO withdrawals (coach_id, amount, status, flow_no, bank_name, bank_account, remark) "
+               "VALUES (%s,%s,'pending',%s,%s,%s,%s)",
+               (user["id"], amount, flow_no, data.bank_name, digits, data.remark))
+    return {"ok": True, "flow_no": flow_no, "frozen": True,
+            "msg": "提现申请已提交，金额已冻结，等待管理员审核"}
 
 
 @router.get("/admin/withdrawals")
@@ -200,6 +248,8 @@ def admin_withdrawals(status: str = None, user: dict = Depends(require_role("adm
         params.append(status)
     rows = db.query(f"SELECT w.*, u.nickname AS coach_name FROM withdrawals w JOIN users u ON u.id=w.coach_id "
                     f"WHERE {where} ORDER BY w.id DESC", tuple(params))
+    for r in rows:
+        r["bank_account"] = _mask_card(r.get("bank_account"))
     return rows
 
 
@@ -208,8 +258,25 @@ def process_withdraw(wid: int, action: str, user: dict = Depends(require_role("a
     if action not in ("approve", "reject"):
         raise HTTPException(400, "action必须是approve或reject")
     st = "approved" if action == "approve" else "rejected"
-    db.execute("UPDATE withdrawals SET status=%s, processed_at=NOW() WHERE id=%s", (st, wid))
-    return {"ok": True}
+    affected = db.execute(
+        "UPDATE withdrawals SET status=%s, processed_at=NOW(), "
+        "remark=CONCAT(COALESCE(remark,''), %s) WHERE id=%s AND status='pending'",
+        (st, f" | {action}@{datetime.now():%Y-%m-%d %H:%M}", wid))
+    if affected == 0:
+        raise HTTPException(400, "该提现单不存在或已处理")
+    return {"ok": True, "status": st}
+
+
+# ==================== 邮件待发箱（A4） ====================
+@router.get("/admin/email-outbox")
+def list_email_outbox(user: dict = Depends(require_role("admin"))):
+    return db.query("SELECT id, to_addr, subject, status, attempts, last_error, created_at, sent_at "
+                    "FROM email_outbox ORDER BY id DESC LIMIT 50")
+
+
+@router.post("/admin/email-outbox/retry")
+def retry_email_outbox(user: dict = Depends(require_role("admin"))):
+    return retry_outbox()
 
 
 # ==================== P2-13 会员内容墙 ====================

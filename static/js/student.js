@@ -109,6 +109,55 @@ async function viewDashboard(el) {
   });
 }
 
+/* ================= 姿态骨架叠加 ================= */
+const POSE_CONNECTIONS = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [11, 23], [12, 24], [23, 24], [23, 25], [25, 27],
+  [24, 26], [26, 28], [27, 31], [28, 32], [27, 29],
+  [29, 31], [28, 30], [30, 32], [15, 17], [15, 19],
+  [15, 21], [16, 18], [16, 20], [16, 22],
+];
+
+function drawPoseOverlay(imgEl, canvas, keypoints) {
+  const draw = () => {
+    const w = imgEl.naturalWidth;
+    const h = imgEl.naturalHeight;
+    if (!w || !h) return;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    const pt = (i) => {
+      const k = keypoints[i];
+      return k && k.v >= 0.4 ? { x: k.x * w, y: k.y * h } : null;
+    };
+    ctx.lineWidth = Math.max(2, w / 320);
+    ctx.strokeStyle = "rgba(46,139,132,0.95)";
+    POSE_CONNECTIONS.forEach(([a, b]) => {
+      const p1 = pt(a);
+      const p2 = pt(b);
+      if (!p1 || !p2) return;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    });
+    keypoints.forEach((k, i) => {
+      if (k.v < 0.4) return;
+      const isCore = [11, 12, 23, 24, 25, 26].includes(i);
+      ctx.beginPath();
+      ctx.arc(k.x * w, k.y * h, Math.max(3, w / (isCore ? 180 : 260)), 0, Math.PI * 2);
+      ctx.fillStyle = isCore ? "#e8a33d" : "#ffffff";
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, w / 900);
+      ctx.strokeStyle = "#2E8B84";
+      ctx.stroke();
+    });
+  };
+  if (imgEl.complete && imgEl.naturalWidth) draw();
+  else imgEl.onload = draw;
+}
+
 /* ================= 每日康复日志 ================= */
 async function viewCheckin(el) {
   killCharts();
@@ -205,18 +254,28 @@ async function viewCheckin(el) {
     try {
       const res = await api("/api/features/ai-evaluate", { method: "POST", body: { image_url: img.path } });
       const a = res.analysis;
+      const m = a.metrics || {};
+      const metricLine = a.exercise === "shoulder_abduction"
+        ? `肩外展 ${m.abduction_deg ?? "-"}° · 肘伸展 ${m.elbow_deg ?? "-"}° · 躯干侧倾 ${m.shoulder_tilt_deg ?? "-"}°`
+        : `膝角 ${m.knee_angle ?? "-"}° · 膝内扣 ${m.valgus_deg ?? "-"}° · 躯干前倾 ${m.trunk_lean_deg ?? "-"}° · 左右差 ${m.symmetry_deg ?? "-"}°`;
       aiResult.innerHTML = `
         <div style="padding:12px;background:rgba(99,184,174,0.1);border:1px solid rgba(99,184,174,0.3);border-radius:8px">
           <div class="flex between" style="margin-bottom:8px">
-            <b>🤖 AI 姿势评分</b>
+            <b>🤖 姿态评分</b>
             <span style="font-size:20px;font-weight:800;color:${a.score >= 85 ? 'var(--success)' : a.score >= 70 ? 'var(--warning)' : 'var(--danger)'}">${a.score}分</span>
           </div>
-          <div style="color:var(--text-2);font-size:13px;margin-bottom:6px">识别动作：${escapeHtml(a.pose)}</div>
+          <div style="color:var(--text-2);font-size:13px;margin-bottom:6px">识别动作：${escapeHtml(a.pose)} · ${escapeHtml(metricLine)}</div>
+          <div style="position:relative;display:inline-block;max-width:100%;margin:6px 0">
+            <img id="ai-pose-img" src="/uploads/${img.path}" style="max-width:100%;border-radius:8px;display:block">
+            <canvas id="ai-pose-canvas" style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none"></canvas>
+          </div>
           <div style="font-size:13px;line-height:1.7">
             <b>问题：</b>${a.issues.map((i) => `<div>· ${escapeHtml(i)}</div>`).join("")}
             <div style="margin-top:6px"><b>建议：</b>${escapeHtml(a.tips)}</div>
           </div>
         </div>`;
+      drawPoseOverlay(aiResult.querySelector("#ai-pose-img"),
+        aiResult.querySelector("#ai-pose-canvas"), a.keypoints || []);
     } catch (err) {
       aiResult.innerHTML = `<div style="color:var(--danger);font-size:13px">${escapeHtml(err.message)}</div>`;
     } finally {
@@ -1000,8 +1059,9 @@ async function viewMember(el) {
             try {
               const body = { plan };
               if (months) body.months = months;
-              const res = await api("/api/member/subscribe", { method: "POST", body });
+              const order = await api("/api/member/subscribe", { method: "POST", body });
               closeModal();
+              await sandboxCheckout(order);
               toast("🎉 支付成功！已开通会员", "success");
               viewMember(el);
               // 刷新sidebar会员徽章
@@ -1034,11 +1094,12 @@ async function viewMember(el) {
         onMount(modal) {
           modal.querySelector("#do-coach-pay").onclick = async () => {
             try {
-              await api("/api/member/subscribe", {
+              const order = await api("/api/member/subscribe", {
                 method: "POST",
                 body: { plan: "paid_plan", coach_id: +b.dataset.coach },
               });
               closeModal();
+              await sandboxCheckout(order);
               toast("🎉 已购买！康复治疗师将立即收到通知", "success");
               viewMember(el);
             } catch (err) { toast(err.message, "error"); }
@@ -1048,6 +1109,46 @@ async function viewMember(el) {
     };
   });
   renderCoupons(el.querySelector("#coupon-box")).catch((e) => {});
+}
+
+/* ================= 沙箱收银台 ================= */
+function sandboxCheckout(order) {
+  return new Promise((resolve, reject) => {
+    openModal({
+      title: "沙箱收银台 · Sandbox",
+      body: `
+        <div style="line-height:1.9">
+          <div class="flex between"><span style="color:var(--text-2)">订单号</span><b>${escapeHtml(order.order_no)}</b></div>
+          <div class="flex between"><span style="color:var(--text-2)">应付金额</span><b style="color:var(--warning);font-size:20px">¥${order.amount}</b></div>
+          <div style="margin-top:10px;font-size:12px;color:var(--text-2)">
+            沙箱环境，不接真实支付渠道。点击「模拟支付」后按网关方式发起 HMAC 签名回调，
+            后端校验签名与时间戳并幂等入账。
+          </div>
+        </div>`,
+      footer: `<button class="btn ghost" id="sandbox-cancel">取消</button>
+               <button class="btn warn" id="sandbox-pay">模拟支付 ¥${order.amount}</button>`,
+      onMount(modal) {
+        modal.querySelector("#sandbox-cancel").onclick = () => {
+          closeModal();
+          reject(new Error("已取消支付"));
+        };
+        modal.querySelector("#sandbox-pay").onclick = async (e) => {
+          e.target.disabled = true;
+          try {
+            const res = await api("/api/member/sandbox/pay", {
+              method: "POST",
+              body: { order_no: order.order_no },
+            });
+            closeModal();
+            resolve(res);
+          } catch (err) {
+            e.target.disabled = false;
+            toast(err.message, "error");
+          }
+        };
+      },
+    });
+  });
 }
 
 /* ================= 视图注册结束 ================= */

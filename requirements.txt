@@ -8,3 +8,5 @@ python-multipart==0.0.9
 aiofiles==24.1.0
 pydantic==2.9.2
 cryptography>=42.0
+mediapipe==1.2.2
+opencv-contrib-python==5.0.0.93

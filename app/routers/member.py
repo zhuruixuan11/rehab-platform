@@ -1,10 +1,11 @@
 """变现相关接口（订阅/会员/教练付费定制/订单）。"""
-from datetime import date, datetime, timedelta
+from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.auth.deps import get_current_user, require_role
 from app.database import db
+from app.services import payment
 
 router = APIRouter(prefix="/api/member", tags=["会员/变现"])
 
@@ -67,10 +68,10 @@ def member_status(user: dict = Depends(get_current_user)):
     }
 
 
-# ---------- 订阅/下单 ----------
+# ---------- 订阅/下单（沙箱支付） ----------
 @router.post("/subscribe")
 def subscribe(data: SubscribeIn, user: dict = Depends(get_current_user)):
-    """创建订单（mock 支付：直接标记 paid，真实上线前接微信/支付宝）。"""
+    """创建 pending 订单并返回沙箱收银台参数；支付成功以签名回调为准。"""
     if user["role"] != "student":
         raise HTTPException(403, "仅学员可以订阅")
 
@@ -79,10 +80,10 @@ def subscribe(data: SubscribeIn, user: dict = Depends(get_current_user)):
 
     if data.plan == "monthly":
         amount = months_map.get(data.months, 19.90)
-        duration = timedelta(days=30 * data.months)
+        duration_days = 30 * data.months
     elif data.plan == "yearly":
         amount = prices["yearly"]
-        duration = timedelta(days=365)
+        duration_days = 365
     elif data.plan == "paid_plan":
         if not data.coach_id:
             raise HTTPException(400, "请选择教练")
@@ -91,7 +92,7 @@ def subscribe(data: SubscribeIn, user: dict = Depends(get_current_user)):
         if not coach:
             raise HTTPException(404, "该教练未开放付费定制")
         amount = float(coach["paid_plan_price"])
-        duration = timedelta(days=30)
+        duration_days = 30
     elif data.plan == "bootcamp":
         if not data.bootcamp_id:
             raise HTTPException(400, "请选择训练营")
@@ -99,44 +100,43 @@ def subscribe(data: SubscribeIn, user: dict = Depends(get_current_user)):
         if not camp or not camp["is_paid"]:
             raise HTTPException(404, "训练营不存在或非付费营")
         amount = float(camp["price"])
-        duration = timedelta(days=30)
+        duration_days = 30
     else:
         raise HTTPException(400, "不支持的计划类型")
 
-    order_no = f"ORD{datetime.now().strftime('%Y%m%d%H%M%S')}{user['id']:04d}"
-    today = date.today()
-    # 会员续费处理（保留原有到期日）
-    existing = get_active_subscription(user["id"])
-    start_date = existing["expire_date"] if existing and data.plan in ("monthly", "yearly") else today
-    expire_date = start_date + duration
+    order = payment.create_order(user["id"], data.plan, amount, duration_days,
+                                 coach_id=data.coach_id, bootcamp_id=data.bootcamp_id)
+    order["pay_url"] = f"/api/member/sandbox/pay"
+    return {"ok": True, **order}
 
-    db.execute("""
-        INSERT INTO subscriptions (user_id, plan, order_no, amount, status, start_date, expire_date,
-                                   coach_id, bootcamp_id, paid_at, notes)
-        VALUES (%s, %s, %s, %s, 'paid', %s, %s, %s, %s, NOW(), %s)
-    """, (user["id"], data.plan, order_no, amount, start_date, expire_date,
-          data.coach_id, data.bootcamp_id, "mock支付-订阅接口"))
-    sub_id = db.query("SELECT LAST_INSERT_ID() id", one=True)["id"]
 
-    db.execute("""
-        INSERT INTO user_payments (user_id, type, item_id, amount, status)
-        VALUES (%s, %s, %s, %s, 'paid')
-    """, (user["id"], data.plan, sub_id, amount))
+class NotifyIn(BaseModel):
+    order_no: str
+    amount: float
+    timestamp: int
+    sign: str
 
-    # 付费定制计划：自动创建空训练计划，教练端可见，等教练填写
-    if data.plan == "paid_plan" and data.coach_id:
-        student = db.query("SELECT nickname FROM users WHERE id=%s", (user["id"],), one=True)
-        plan_id = db.execute("""
-            INSERT INTO rehab_programs (student_id, coach_id, title, start_date, end_date, status, is_recommended)
-            VALUES (%s, %s, %s, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 30 DAY), 'active', 1)
-        """, (user["id"], data.coach_id, f"【付费定制】{student['nickname']}的专属计划"))
-        # 发送消息通知教练
-        from app.services.message_service import send_message
-        send_message(user["id"], data.coach_id, "text",
-                     f"🎉 学员 {student['nickname']} 付费 ¥{amount} 购买了你的定制计划，请尽快在「计划制定」中填充内容～")
-        return {"ok": True, "order_no": order_no, "expire_date": str(expire_date), "plan_id": plan_id}
 
-    return {"ok": True, "order_no": order_no, "expire_date": str(expire_date), "amount": amount}
+@router.post("/notify")
+def pay_notify(data: NotifyIn):
+    """沙箱支付回调：HMAC 验签 + 时间戳窗口 + 幂等入账。"""
+    return payment.handle_notify(data.order_no, data.amount, data.timestamp, data.sign)
+
+
+class SandboxPayIn(BaseModel):
+    order_no: str
+
+
+@router.post("/sandbox/pay")
+def sandbox_pay(data: SandboxPayIn, user: dict = Depends(get_current_user)):
+    """模拟网关发起回调（仅用于演示，不接真实渠道）。"""
+    return payment.sandbox_pay(data.order_no, user["id"])
+
+
+# ---------- 兼容旧前端的支付入口：内部仍走签名回调 ----------
+@router.post("/pay-success/{order_no}")
+def pay_success(order_no: str, user: dict = Depends(get_current_user)):
+    return payment.sandbox_pay(order_no, user["id"])
 
 
 # ---------- 教练：付费定制开关 ----------

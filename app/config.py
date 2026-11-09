@@ -59,5 +59,10 @@ class Settings:
     SMTP_FROM = os.getenv("SMTP_FROM", "") or os.getenv("SMTP_USER", "")
     SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "1") == "1"
 
+    # 沙箱支付与对外链接
+    SANDBOX_PAY_SECRET = os.getenv("SANDBOX_PAY_SECRET", "rehab-sandbox-secret-2026")
+    SANDBOX_PAY_SIGN_TTL = int(os.getenv("SANDBOX_PAY_SIGN_TTL", "300"))
+    PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+
 
 settings = Settings()
