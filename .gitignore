@@ -5,3 +5,6 @@ logs/
 uploads/
 *.log
 uvicorn_out.txt
+
+# 姿态评分模型（官方可下载，见 README 第七节）
+app/models/*.task

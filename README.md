@@ -149,3 +149,23 @@ static/
   js/admin.js       # 管理端视图
 sql/init.sql        # 康复化建表脚本
 ```
+
+---
+
+## 七、动作姿态评分模型（不入库）
+
+`app/services/pose.py` 用 MediaPipe Pose Landmarker（full, float16）做 CPU 推理，
+模型文件 `app/models/pose_landmarker_full.task` 约 9 MB，官方有稳定下载源，
+因此不纳入版本库（`.gitignore` 已忽略 `app/models/*.task`）。
+
+克隆后手动下载一次：
+
+```bash
+# 在项目根目录执行
+mkdir -p app/models
+curl -L -o app/models/pose_landmarker_full.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
+```
+
+校验：文件约 9.4 MB（约 9,398,198 字节）。缺失时仅「AI 姿势点评」接口返回
+HTTP 422「姿态模型缺失：…」，其余功能不受影响。
